@@ -1,2 +1,6 @@
 ./CDK-course-resources
 CDK-course-resources/*
+cdk-starter/node-modules/*
+cdk-starter/node-modules/
+cdk-starter/cdk-out/*
+

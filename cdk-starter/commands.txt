@@ -1,0 +1,12 @@
+ cdk init app --language typescript
+
+ # To run cdk deploy we need some bootstrap preparations so we run 
+ cdk bootstrap
+
+cdk synth only generates a template it will deploy into Cloud formation
+cdk deploy deploys to CF
+
+cdk list list all the stacks
+cdk diff show diff in local and Cloud
+cdk doctor 
+cdk destroy stackname
