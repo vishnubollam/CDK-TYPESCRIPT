@@ -1,0 +1,9 @@
+[
+  {
+    "repoName": "cdk-starter",
+    "fixed": [
+      "DEP-@babel/helpers-@babel/helpers"
+    ],
+    "unresolved": []
+  }
+]
