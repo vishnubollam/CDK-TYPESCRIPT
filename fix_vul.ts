@@ -2,8 +2,11 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { Octokit } from '@octokit/rest';
 
 const execPromise = promisify(exec);
+
+const LARGE_BUFFER = 1024 * 1024 * 100;
 
 interface NpmAuditResult {
   vulnerabilities: Record<string, { name: string; severity: string; via: any[]; range: string; fixAvailable?: any }>;
@@ -18,7 +21,9 @@ interface Vulnerability {
 
 interface VulnerabilityReport {
   repoName: string;
+  fixedCount: number;
   fixed: string[];
+  unresolvedCount: number;
   unresolved: string[];
   prLink?: string;
 }
@@ -38,6 +43,7 @@ class VulnerabilityFixer {
       const packageJsonPaths = await this.findPackageJsonFiles(this.config.reposDir);
       console.log(`Found ${packageJsonPaths.length} package.json files to scan`);
 
+      // Process repositories concurrently with a limit
       for (let i = 0; i < packageJsonPaths.length; i += this.concurrencyLimit) {
         const chunk = packageJsonPaths.slice(i, i + this.concurrencyLimit);
         await Promise.all(chunk.map(packageJsonPath => this.processRepository(path.dirname(packageJsonPath))));
@@ -78,56 +84,71 @@ class VulnerabilityFixer {
 
   private async processRepository(repoPath: string): Promise<void> {
     const repoName = path.basename(repoPath);
-    const repoReport: VulnerabilityReport = { repoName, fixed: [], unresolved: [] };
+    const repoReport: VulnerabilityReport = { repoName, fixedCount: 0, fixed: [], unresolvedCount: 0, unresolved: [] };
     let currentBranch: string | undefined;
     let hadStash = false;
 
     try {
-      console.log(`Processing repository: ${repoPath}`);
+      console.log(`\n--- Processing repository: ${repoPath} ---`);
 
-      const packageJsonPath = path.join(repoPath, 'package.json');
-      await fs.access(packageJsonPath, fs.constants.R_OK);
+      await fs.access(path.join(repoPath, 'package.json'), fs.constants.R_OK);
+      await execPromise('git rev-parse --is-inside-work-tree', { cwd: repoPath });
 
       currentBranch = (await execPromise('git branch --show-current', { cwd: repoPath })).stdout.trim();
-      if (currentBranch !== 'main') {
+      if (currentBranch !== 'dev') {
         const { stdout: status } = await execPromise('git status --porcelain', { cwd: repoPath });
         if (status) {
-          await execPromise('git stash push -m "auto-stash-before-vuln-fix"', { cwd: repoPath });
+          console.log(`Stashing changes in ${repoPath}`);
+          await execPromise('git stash push -m "auto-stash-before-vuln-fix" --quiet', { cwd: repoPath });
           hadStash = true;
         }
-        await execPromise('git checkout main', { cwd: repoPath });
-        await execPromise('git pull origin main', { cwd: repoPath });
+        console.log(`Checking out dev in ${repoPath}`);
+        await execPromise('git checkout dev --quiet', { cwd: repoPath });
+        console.log(`Pulling dev in ${repoPath}`);
+        await execPromise('git pull origin dev --quiet', { cwd: repoPath });
       }
 
       const branchName = `fix/vuls-${repoName}-${Date.now()}`;
-      await execPromise(`git checkout -b ${branchName}`, { cwd: repoPath });
+      console.log(`Creating branch ${branchName} in ${repoPath}`);
+      await execPromise(`git checkout -b ${branchName} --quiet`, { cwd: repoPath });
 
       await this.ensureDependenciesInstalled(repoPath);
       const vulnerabilities = await this.detectDependencyVulnerabilities(repoPath, repoReport);
 
       if (vulnerabilities.length > 0) {
         await this.applyFixes(repoPath, repoReport, vulnerabilities);
-        const prLink = await this.commitAndPushChanges(repoPath, branchName);
+        const prLink = await this.commitAndPushChanges(repoPath, branchName, repoName);
         repoReport.prLink = prLink;
       } else {
         console.log(`No vulnerabilities found in ${repoPath}`);
+        await execPromise(`git checkout ${currentBranch} --quiet`, { cwd: repoPath });
+        await execPromise(`git branch -d ${branchName} --quiet`, { cwd: repoPath });
       }
+
+      // Update counts in the report
+      repoReport.fixedCount = repoReport.fixed.length;
+      repoReport.unresolvedCount = repoReport.unresolved.length;
     } catch (error) {
       console.error(`Error processing ${repoPath}:`, error.message);
       repoReport.unresolved.push(`Processing failed - ${error.message}`);
+      repoReport.unresolvedCount = repoReport.unresolved.length;
     } finally {
       if (currentBranch) {
         try {
-          await execPromise(`git checkout ${currentBranch}`, { cwd: repoPath });
+          console.log(`Restoring branch ${currentBranch} in ${repoPath}`);
+          await execPromise(`git checkout ${currentBranch} --quiet`, { cwd: repoPath });
           if (hadStash) {
-            await execPromise('git stash apply', { cwd: repoPath });
+            console.log(`Popping stash in ${repoPath}`);
+            await execPromise('git stash pop --quiet', { cwd: repoPath });
           }
         } catch (cleanupError) {
           console.error(`Failed to cleanup ${repoPath}:`, cleanupError.message);
           repoReport.unresolved.push(`Cleanup failed - ${cleanupError.message}`);
+          repoReport.unresolvedCount = repoReport.unresolved.length;
         }
       }
       this.report.push(repoReport);
+      console.log(`--- Finished processing ${repoPath} ---`);
     }
   }
 
@@ -149,10 +170,9 @@ class VulnerabilityFixer {
 
   private async detectDependencyVulnerabilities(repoPath: string, repoReport: VulnerabilityReport): Promise<Vulnerability[]> {
     const vulnerabilities: Vulnerability[] = [];
-
     try {
       console.log(`Running npm audit in ${repoPath}`);
-      const { stdout, stderr } = await execPromise('npm audit --json', { cwd: repoPath, maxBuffer: 1024 * 1024 });
+      const { stdout, stderr } = await execPromise('npm audit --json', { cwd: repoPath, maxBuffer: LARGE_BUFFER });
 
       if (stderr) console.warn(`npm audit warning: ${stderr}`);
 
@@ -190,29 +210,11 @@ class VulnerabilityFixer {
           }
         } catch (parseError) {
           console.error(`Failed to parse audit output in ${repoPath}:`, parseError.message);
-          repoReport.unresolved.push(`${repoPath}: Audit output parsing failed - ${parseError.message}`);
+          repoReport.unresolved.push(`Audit output parsing failed - ${parseError.message}`);
         }
       } else {
         console.error(`Audit failed in ${repoPath}:`, error.message);
-        if (error.stderr) console.error(`Audit stderr: ${error.stderr}`);
-        if (error.stdout) console.error(`Audit stdout: ${error.stdout}`);
-        if (error.code) console.error(`Exit code: ${error.code}`);
-
-        const lockFilePath = path.join(repoPath, 'package-lock.json');
-        const hasLockFile = await fs.stat(lockFilePath).catch(() => false);
-        if (!hasLockFile) {
-          console.error(`No package-lock.json found in ${repoPath}. Attempting to generate...`);
-          try {
-            await execPromise('npm install', { cwd: repoPath });
-            console.log(`Generated package-lock.json in ${repoPath}. Retrying audit...`);
-            return this.detectDependencyVulnerabilities(repoPath, repoReport); // Retry
-          } catch (installError) {
-            console.error(`Failed to generate package-lock.json: ${installError.message}`);
-            repoReport.unresolved.push(`${repoPath}: Failed to generate package-lock.json - ${installError.message}`);
-          }
-        }
-
-        repoReport.unresolved.push(`${repoPath}: Audit failed - ${error.message}`);
+        repoReport.unresolved.push(`Audit failed - ${error.message}`);
       }
     }
     return vulnerabilities;
@@ -222,6 +224,7 @@ class VulnerabilityFixer {
     try {
       const preVulnIds = new Set(vulnerabilities.map(v => v.id));
 
+      console.log(`Applying fixes in ${repoPath}`);
       await execPromise('npm audit fix', { cwd: repoPath });
 
       const postVulnerabilities = await this.detectDependencyVulnerabilities(repoPath, repoReport);
@@ -240,22 +243,58 @@ class VulnerabilityFixer {
     }
   }
 
-  private async commitAndPushChanges(repoPath: string, branchName: string): Promise<string | undefined> {
-    try {
-      await execPromise('git add .', { cwd: repoPath });
-      await execPromise('git commit -m "Automated vulnerability fixes"', { cwd: repoPath });
-      await execPromise(`git push origin ${branchName}`, { cwd: repoPath });
+  private async commitAndPushChanges(repoPath: string, branchName: string, repoName: string): Promise<string | undefined> {
+    const octokit = new Octokit({
+      auth: ' ADD GH TOKEN HERE ', // Replace with your token
+    });
 
-      const { stdout } = await execPromise(
-        `gh pr create --base main --title "Automated vulnerability fixes for ${path.basename(repoPath)}" --body "Fixes vulnerabilities detected by npm audit"`,
-        { cwd: repoPath }
-      );
-      const prLink = stdout.trim();
+    try {
+      console.log(`Staging package.json and package-lock.json in ${repoPath}`);
+      await execPromise('git add package.json package-lock.json', { cwd: repoPath });
+
+      console.log(`Checking for changes in ${repoPath}`);
+      const { stdout: status } = await execPromise('git status --porcelain', { cwd: repoPath, maxBuffer: LARGE_BUFFER });
+      if (!status) {
+        console.log(`No changes detected after fixes in ${repoPath}`);
+        await execPromise(`git checkout dev --quiet`, { cwd: repoPath });
+        await execPromise(`git branch -d ${branchName} --quiet`, { cwd: repoPath });
+        return undefined;
+      }
+
+      console.log(`Adding all changes in ${repoPath}`);
+      await execPromise('git add .', { cwd: repoPath });
+
+      console.log(`Committing changes in ${repoPath}`);
+      await execPromise('git commit -m "Automated vulnerability fixes" --quiet', { cwd: repoPath });
+
+      console.log(`Pushing changes to ${branchName} in ${repoPath}`);
+      await execPromise(`git push origin ${branchName} --quiet`, { cwd: repoPath, maxBuffer: LARGE_BUFFER });
+
+      console.log(`Fetching remote URL for ${repoPath}`);
+      const { stdout: remoteUrl } = await execPromise('git remote get-url origin', { cwd: repoPath, maxBuffer: LARGE_BUFFER });
+      const repoSlug = remoteUrl.trim().match(/github\.com[/:](.+?\/.+?)(\.git)?$/)?.[1];
+      if (!repoSlug) {
+        throw new Error('Could not determine repository slug from remote URL');
+      }
+
+      const [owner, repo] = repoSlug.split('/');
+
+      console.log(`Creating PR for ${repoPath} via GitHub API`);
+      const prResponse = await octokit.pulls.create({
+        owner,
+        repo,
+        title: `Automated vulnerability fixes for ${repoName}`,
+        body: 'Fixes vulnerabilities detected by npm audit',
+        head: branchName,
+        base: 'dev',
+      });
+
+      const prLink = prResponse.data.html_url;
       console.log(`PR created for ${repoPath}: ${prLink}`);
       return prLink;
     } catch (error) {
-      console.log(`No changes to commit or push failed in ${repoPath}:`, error.message);
-      return undefined;
+      console.error(`Failed to commit or push changes in ${repoPath}:`, error.message);
+      throw error;
     }
   }
 }
